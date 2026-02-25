@@ -1,0 +1,744 @@
+================================================================================
+  DOCUMENTATION: augmentation_birefnet.py
+  Tăng Cường Dữ Liệu cho Fine-Tuning BiRefNet — Tách Nền Lá Cây
+  Ngày tạo : 2026-02-25
+  Tác giả  : Research Team
+================================================================================
+
+
+MỤC LỤC
+--------
+  1. Tổng Quan
+  2. Yêu Cầu Hệ Thống
+  3. Cấu Trúc Thư Mục
+  4. Cấu Hình (Hyperparameters)
+  5. Mô Tả Các Module
+     5.1  Module 1 — Spatial Transforms
+     5.2  Module 2 — Photometric Transforms
+     5.3  Module 3 — Copy-Paste Augmentation
+     5.4  Module 4 — MixUp Augmentation
+     5.5  Module 5 — CutMix Augmentation
+     5.6  Module 6 — Multi-Scale Strategy
+  6. Các Hàm Tiện Ích
+     6.1  load_pairs()
+     6.2  save_pair()
+     6.3  augment_single()
+     6.4  generate_synthetic_background()
+  7. Pipeline Chính — run_augmentation_pipeline()
+  8. Dataset Class — BiRefNetDataset
+  9. Cách Sử Dụng
+  10. Quy Ước Đặt Tên File
+  11. Kết Quả Đầu Ra
+  12. Lưu Ý Kỹ Thuật
+  13. Tài Liệu Tham Khảo
+
+
+================================================================================
+1. TỔNG QUAN
+================================================================================
+
+File   : augmentation_birefnet.py
+Mục đích:
+  Script tự động hóa toàn bộ quy trình tăng cường dữ liệu (data augmentation)
+  phục vụ fine-tuning mô hình BiRefNet cho bài toán tách nền lá cây (hard
+  background removal). Script được thiết kế đặc biệt cho các trường hợp khó:
+    - Lá cây nhỏ (foreground ratio < 10%)
+    - Màu sắc lá tương đồng với nền (camouflage)
+    - Điều kiện ánh sáng phức tạp (ngược sáng, bóng đổ, sương mù)
+    - Lá bị che khuất một phần (partial occlusion)
+
+Input  : 700 ảnh gốc (JPG) + 700 mask nhị phân (PNG), kích thước 1024×1024
+Output : ~7.000–10.000+ cặp ảnh/mask augmented
+
+Phương pháp:
+  Kết hợp 5 kỹ thuật augmentation hiện đại:
+    (1) Spatial Transforms        — biến đổi hình học
+    (2) Photometric Transforms    — biến đổi màu sắc / ánh sáng
+    (3) Copy-Paste Augmentation   — tách lá dán lên nền tổng hợp
+    (4) MixUp Augmentation        — trộn tuyến tính 2 cặp mẫu
+    (5) CutMix Augmentation       — hoán đổi vùng hình chữ nhật
+
+
+================================================================================
+2. YÊU CẦU HỆ THỐNG
+================================================================================
+
+Python       : >= 3.8
+Thư viện     :
+  albumentations  >= 1.3.0    (biến đổi hình học và màu sắc)
+  opencv-python   >= 4.8.0    (đọc/ghi/xử lý ảnh)
+  numpy           >= 1.24.0   (tính toán mảng)
+  tqdm            >= 4.65.0   (thanh tiến trình)
+  torch           >= 2.0.0    (tùy chọn — cho BiRefNetDataset)
+  torchvision     >= 0.15.0   (tùy chọn — cho normalize)
+
+Cài đặt nhanh:
+  pip install albumentations opencv-python numpy tqdm
+
+Phần cứng    :
+  RAM          : >= 8 GB
+  Ổ đĩa trống : >= 20 GB (output ~3–5 GB tùy cấu hình)
+  CPU          : Đa nhân khuyến nghị (script chạy đơn luồng)
+
+Thời gian ước tính:
+  700 ảnh × 9 lần augment + copy-paste + mixup + cutmix ≈ 25–60 phút
+
+
+================================================================================
+3. CẤU TRÚC THƯ MỤC
+================================================================================
+
+Đầu vào (Input):
+  segmentation_dataset/
+  ├── train/
+  │   ├── images/       ← 700 file *.jpg (1024×1024)
+  │   └── masks/        ← 700 file *.png (binary: 0 và 255)
+  ├── val/
+  │   ├── images/       ← 150 file *.jpg (KHÔNG augment)
+  │   └── masks/        ← 150 file *.png (KHÔNG augment)
+  └── test/
+      ├── images/       ← 150 file *.jpg (KHÔNG augment)
+      └── masks/        ← 150 file *.png (KHÔNG augment)
+
+Đầu ra (Output):
+  segmentation_dataset/
+  └── train_augmented/
+      ├── images/       ← ~10.000+ file *.jpg
+      └── masks/        ← ~10.000+ file *.png
+
+LƯU Ý: Val và test KHÔNG BAO GIỜ bị augment để tránh data leakage.
+
+
+================================================================================
+4. CẤU HÌNH (HYPERPARAMETERS)
+================================================================================
+
+Được định nghĩa ở đầu script, có thể chỉnh sửa trực tiếp:
+
+  IMAGE_SIZE       = 1024    Kích thước input BiRefNet (cao × rộng)
+                             Không nên thay đổi nếu dùng BiRefNet gốc.
+
+  TARGET_TOTAL     = 7000    Tổng số mẫu mục tiêu SAU augmentation.
+                             Thực tế có thể nhiều hơn do copy-paste, mixup,
+                             cutmix tính riêng.
+
+  RANDOM_SEED      = 42      Seed ngẫu nhiên — đảm bảo tái tạo kết quả.
+
+  COPY_PASTE_RATIO = 0.25    Tỉ lệ mẫu copy-paste / TARGET_TOTAL.
+                             Mặc định: 0.25 × 7000 = 1750 mẫu.
+
+  MIXUP_RATIO      = 0.10    Tỉ lệ mẫu mixup / TARGET_TOTAL.
+                             Mặc định: 0.10 × 7000 = 700 mẫu.
+
+  CUTMIX_RATIO     = 0.10    Tỉ lệ mẫu cutmix / TARGET_TOTAL.
+                             Mặc định: 0.10 × 7000 = 700 mẫu.
+
+Biến đường dẫn:
+  BASE_DIR    = .../segmentation_dataset
+  TRAIN_IMG   = BASE_DIR / "train" / "images"
+  TRAIN_MASK  = BASE_DIR / "train" / "masks"
+  AUG_IMG     = BASE_DIR / "train_augmented" / "images"
+  AUG_MASK    = BASE_DIR / "train_augmented" / "masks"
+
+
+================================================================================
+5. MÔ TẢ CÁC MODULE
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+5.1  MODULE 1 — SPATIAL TRANSFORMS
+     Hàm: get_spatial_transform(is_hard: bool = False) -> A.Compose
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  Biến đổi hình học áp dụng ĐỒNG BỘ lên cả ảnh và mask. Đây là yêu cầu
+  bắt buộc trong segmentation: mọi phép biến đổi không gian phải áp dụng
+  giống hệt nhau cho ảnh và mask tương ứng.
+
+Tham số:
+  is_hard (bool):
+    True  → Dùng bộ biến đổi nặng (60% trường hợp augment chính)
+    False → Dùng bộ biến đổi nhẹ (40% còn lại, dùng trong copy-paste)
+
+Bộ biến đổi HARD (is_hard=True):
+  ┌──────────────────────┬──────────────────────────┬────────┐
+  │ Phép biến đổi        │ Tham số                  │ Xác suất│
+  ├──────────────────────┼──────────────────────────┼────────┤
+  │ HorizontalFlip       │ —                        │  0.50  │
+  │ VerticalFlip         │ —                        │  0.30  │
+  │ RandomRotate90       │ —                        │  0.50  │
+  │ Rotate               │ limit=45°, REFLECT_101   │  0.70  │
+  │ RandomResizedCrop    │ scale=(0.5,1.0)          │  0.60  │
+  │                      │ ratio=(0.75,1.33)        │        │
+  │ Perspective          │ scale=(0.05,0.15)        │  0.40  │
+  │ ElasticTransform     │ alpha=120, sigma=6.0     │  0.35  │
+  │ GridDistortion       │ num_steps=5, limit=0.3   │  0.30  │
+  │ Affine               │ shear=(-15°,15°)         │  0.50  │
+  │                      │ scale=(0.8,1.2)          │        │
+  │ CoarseDropout        │ 1-4 lỗ, 32-128px         │  0.30  │
+  └──────────────────────┴──────────────────────────┴────────┘
+
+Bộ biến đổi LIGHT (is_hard=False):
+  HorizontalFlip, RandomRotate90, Rotate(±20°), RandomResizedCrop(0.7–1.0)
+
+Lý do chọn:
+  - HorizontalFlip/VerticalFlip : Lá cây đối xứng, không phân biệt hướng.
+  - Rotate                      : Camera cầm tay nghiêng góc ngẫu nhiên.
+  - RandomResizedCrop scale=0.5 : Tạo trường hợp lá nhỏ (FG < 25%) — hard case.
+  - ElasticTransform            : Lá mềm, cong uốn tự nhiên theo gió.
+  - Perspective                 : Góc chụp không vuông góc, lens distortion.
+  - CoarseDropout               : Mô phỏng lá bị cành hoặc vật khác che khuất.
+
+Quan trọng về INTER_NEAREST:
+  Khi resize mask, LUÔN dùng cv2.INTER_NEAREST (nearest-neighbor).
+  Tuyệt đối KHÔNG dùng INTER_LINEAR hoặc INTER_CUBIC vì sẽ tạo ra
+  các giá trị trung gian (ví dụ 128) làm hỏng binary mask.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.2  MODULE 2 — PHOTOMETRIC TRANSFORMS
+     Hàm: get_photometric_transform(intensity: str = "medium") -> A.Compose
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  Biến đổi màu sắc và ánh sáng CHỈ áp dụng lên ẢNH, KHÔNG thay đổi mask.
+  Mô phỏng các điều kiện chụp ảnh thực tế khác nhau.
+
+Tham số:
+  intensity (str): "heavy" | "medium" | "light"
+
+Tỉ lệ chọn trong pipeline chính:
+  photo_pool = [heavy, heavy, medium, medium, light]
+  → Heavy 40%, Medium 40%, Light 20%.
+
+HEAVY intensity:
+  Nhóm Độ sáng/Tương phản:
+    RandomBrightnessContrast  ±0.40   p=0.70  (ảnh sáng/tối cực đoan)
+    RandomGamma               (70,130) p=0.40  (hiệu chỉnh gamma sensor)
+
+  Nhóm Màu sắc:
+    HueSaturationValue        hue±20, sat±40, val±30  p=0.60
+    RGBShift                  ±25 mỗi kênh            p=0.40
+    ColorJitter               b=0.3, c=0.3, s=0.3     p=0.50
+    CLAHE                     clip=4.0, grid=(8,8)     p=0.40
+
+  Nhóm Blur/Noise (OneOf):
+    GaussianBlur              kernel (3,7)             p=0.50 (tổng)
+    MotionBlur                kernel (5,9)
+    MedianBlur                kernel 5
+    Defocus                   radius (3,7)
+
+  Nhóm Nhiễu (OneOf):
+    GaussNoise                var (10,50)              p=0.40 (tổng)
+    ISONoise                  intensity (0.1,0.5)
+    MultiplicativeNoise       multiplier (0.9,1.1)
+
+  Nhóm Thời tiết (OneOf):
+    RandomFog                 fog_coef (0.1,0.4)       p=0.30 (tổng)
+    RandomRain                slant (-10,10), len=10
+    RandomShadow              1-3 bóng đổ
+
+  Hiệu ứng đặc biệt:
+    RandomSunFlare            src_radius=100           p=0.15
+    ImageCompression          quality (60,99)          p=0.30
+    ToGray                    —                        p=0.05
+    ChannelShuffle            —                        p=0.05
+
+MEDIUM intensity:
+  Phiên bản giảm nhẹ: Brightness ±0.30, HSV ±15/30/20, blur nhẹ hơn.
+
+LIGHT intensity:
+  Tối thiểu: Brightness ±0.15, HSV ±10/15/10, GaussianBlur nhỏ.
+
+Lý do chọn:
+  - CLAHE      : Cải thiện chi tiết cho ảnh chụp ngược sáng (backlit leaf).
+  - Fog/Rain   : Điều kiện thời tiết thực tế khi chụp ngoài trời.
+  - SunFlare   : Lens flare từ ánh sáng mặt trời trực tiếp.
+  - ISONoise   : Camera smartphone chụp thiếu sáng, ISO cao.
+  - ToGray     : Một số dataset gốc có thể là ảnh grayscale.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.3  MODULE 3 — COPY-PASTE AUGMENTATION
+     Hàm: copy_paste_augment(), generate_synthetic_background()
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  Tách foreground lá từ ảnh gốc và dán lên nền tổng hợp hoàn toàn khác.
+  Phá vỡ sự phụ thuộc của model vào texture nền của training set.
+
+Hàm generate_synthetic_background(size=1024):
+  Sinh 1 trong 6 loại nền ngẫu nhiên:
+    "gradient"     : Gradient màu tuyến tính theo góc ngẫu nhiên.
+    "noise"        : Nhiễu ngẫu nhiên được làm mờ Gaussian.
+    "texture"      : Bàn cờ (checkerboard) màu ngẫu nhiên.
+    "solid"        : Màu đơn sắc ngẫu nhiên.
+    "checkerboard" : Bàn cờ ô vuông kích thước 32–128px.
+    "blurred_real" : Noise độ phân giải thấp phóng to (blurred noise).
+
+  Lý do dùng nền tổng hợp (KHÔNG dùng ảnh thật từ dataset khác):
+    → Đảm bảo không có data leakage từ nguồn bên ngoài.
+    → Nền đơn giản buộc model học từ foreground features, không từ context.
+    → Dễ kiểm soát và tái tạo (reproducible).
+
+Hàm copy_paste_augment(fg_img, fg_mask, bg, scale_range, edge_blur):
+  Tham số đầu vào:
+    fg_img      (ndarray) : Ảnh lá gốc, BGR, uint8.
+    fg_mask     (ndarray) : Mask nhị phân, grayscale, uint8 (0 hoặc 255).
+    bg          (ndarray) : Ảnh nền, BGR, uint8.
+    scale_range (tuple)   : Phạm vi tỉ lệ thu phóng. Ví dụ: (0.3, 0.95).
+    edge_blur   (bool)    : Có làm mờ cạnh mask không. True = tự nhiên hơn.
+
+  Quy trình:
+    1. Chọn scale ngẫu nhiên trong scale_range.
+    2. Resize foreground + mask theo scale đó.
+    3. Chọn vị trí dán (x_off, y_off) ngẫu nhiên.
+    4. Edge feathering: Làm mờ Gaussian mask biên (kernel 5, 9, hoặc 13px).
+    5. Alpha blending: Trộn lá lên nền theo công thức:
+         result = fg × alpha + bg × (1 - alpha)
+    6. Chuyển mask về binary: alpha > 0.5 → 255, còn lại → 0.
+
+  Tham số đầu ra:
+    result_img  (ndarray) : Ảnh sau copy-paste, 1024×1024, BGR.
+    result_mask (ndarray) : Mask nhị phân tương ứng, 1024×1024.
+
+  Trong pipeline chính:
+    scale_range = (0.3, 0.95)
+    edge_blur = True
+    Số lượng: int(TARGET_TOTAL × COPY_PASTE_RATIO) = 1750 mẫu.
+
+Tham khảo: Ghiasi et al., "Simple Copy-Paste is a Strong Data Augmentation
+Method for Instance Segmentation", CVPR 2021.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.4  MODULE 4 — MIXUP AUGMENTATION
+     Hàm: mixup_augment(img1, mask1, img2, mask2, alpha=0.4)
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  Trộn tuyến tính 2 cặp (ảnh, mask) để tạo mẫu trung gian. Giúp model
+  học boundary mượt mà và tránh overfit trên dữ liệu ít (700 ảnh).
+
+Tham số đầu vào:
+  img1, img2   (ndarray) : Hai ảnh BGR 1024×1024.
+  mask1, mask2 (ndarray) : Hai mask grayscale 1024×1024.
+  alpha        (float)   : Tham số phân phối Beta. Mặc định 0.4.
+
+Công thức:
+  lambda ~ Beta(alpha, alpha),  được clamp vào [0.3, 0.7]
+
+  img_mix  = lambda × img1  + (1-lambda) × img2
+  mask_mix = lambda × mask1 + (1-lambda) × mask2
+
+Lưu ý về mask sau MixUp:
+  Mask không còn binary thuần túy (có giá trị trung gian 0–255).
+  Đây là SOFT LABEL — được thiết kế có chủ đích:
+    - Model học ra xác suất thay vì nhãn cứng.
+    - Tạo hiệu ứng label smoothing tự nhiên.
+    - Cải thiện độ sắc nét boundary khi inference.
+
+Clamp lambda vào [0.3, 0.7]:
+  Tránh trường hợp lambda gần 0 hoặc 1 (gần như không trộn), đảm bảo
+  mẫu MixUp thực sự là sự kết hợp của cả 2 ảnh.
+
+Số lượng: int(TARGET_TOTAL × MIXUP_RATIO) = 700 mẫu.
+
+Tham khảo: Zhang et al., "Mixup: Beyond Empirical Risk Minimization",
+ICLR 2018.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.5  MODULE 5 — CUTMIX AUGMENTATION
+     Hàm: cutmix_augment(img1, mask1, img2, mask2, alpha=1.0)
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  Thay vì trộn toàn bộ như MixUp, CutMix cắt và dán một vùng hình chữ
+  nhật. Mô phỏng occlusion thực tế (lá bị che khuất một phần).
+
+Tham số:
+  alpha (float): Tham số Beta, mặc định 1.0 (phân phối đều hơn).
+
+Thuật toán:
+  1. lam  ~ Beta(alpha, alpha)
+  2. cut_ratio = sqrt(1 - lam)
+  3. Kích thước vùng cắt: H_cut = 1024 × cut_ratio, W_cut tương tự
+  4. Tâm vùng cắt (cx, cy) ngẫu nhiên
+  5. Tọa độ vùng: x1,x2,y1,y2 từ tâm và kích thước (clamped vào [0,1024])
+  6. img1[y1:y2, x1:x2]  = img2[y1:y2, x1:x2]
+  7. mask1[y1:y2, x1:x2] = mask2[y1:y2, x1:x2]
+
+Ưu điểm so với MixUp:
+  - Pixel values không bị trộn lẫn → ảnh vẫn trông tự nhiên hơn.
+  - Mask trong vùng cắt vẫn binary (lấy nguyên từ img2).
+  - Model học cách handle occlusion và partial visibility.
+
+Số lượng: int(TARGET_TOTAL × CUTMIX_RATIO) = 700 mẫu.
+
+Tham khảo: Yun et al., "CutMix: Training Strategy that Makes Use of
+Sample Mixing for Better Performance", ICCV 2019.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.6  MODULE 6 — MULTI-SCALE STRATEGY
+     Hàm: multiscale_resize(img, mask, target_size)
+     Biến: MULTISCALE_SIZES = [384, 512, 640, 768, 1024]
+────────────────────────────────────────────────────────────────────────────────
+
+Mục đích:
+  BiRefNet sử dụng Feature Pyramid Network — mỗi level xử lý 1 scale.
+  Huấn luyện với nhiều độ phân giải kích hoạt đồng đều các pyramid level,
+  giúp model hoạt động tốt với cả vật thể nhỏ lẫn lớn.
+
+Chiến lược Scale-then-Pad:
+  1. Resize ảnh + mask xuống target_size × target_size
+  2. Pad về 1024×1024 bằng zero-padding căn giữa (center-pad)
+  3. Padding value = 0 (pixel đen)
+
+Áp dụng: 20% xác suất trong bước Geometric+Photometric.
+  Nếu được chọn, scale được chọn ngẫu nhiên từ [384, 512, 640, 768].
+
+Lưu ý:
+  Mask dùng INTER_NEAREST khi resize, ảnh dùng mặc định (INTER_LINEAR).
+  Padding cho mask cũng là 0 (background), không ảnh hưởng training.
+
+
+================================================================================
+6. CÁC HÀM TIỆN ÍCH
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+6.1  load_pairs() -> list
+────────────────────────────────────────────────────────────────────────────────
+Đọc tất cả cặp (image, mask) hợp lệ từ thư mục train.
+
+Quy tắc ghép cặp:
+  - Ảnh: {stem}.jpg  trong TRAIN_IMG
+  - Mask: {stem}.png trong TRAIN_MASK (ưu tiên .png)
+  - Nếu không có .png, thử .jpg và .jpeg
+
+Trả về:
+  list of tuple: [(img_path, mask_path, stem), ...]
+  Mỗi tuple chứa đường dẫn tuyệt đối của ảnh, mask, và tên gốc (stem).
+
+────────────────────────────────────────────────────────────────────────────────
+6.2  save_pair(img, mask, name, suffix)
+────────────────────────────────────────────────────────────────────────────────
+Lưu cặp augmented vào thư mục train_augmented.
+
+Tên file output: {name}_{suffix}.jpg / {name}_{suffix}.png
+Chất lượng JPEG: 95 (IMWRITE_JPEG_QUALITY = 95)
+
+Ví dụ:
+  save_pair(img, mask, "catharanthus_roseus_0001_1", "geo_003")
+  → AUG_IMG/catharanthus_roseus_0001_1_geo_003.jpg
+  → AUG_MASK/catharanthus_roseus_0001_1_geo_003.png
+
+────────────────────────────────────────────────────────────────────────────────
+6.3  augment_single(img, mask, spatial_tf, photo_tf) -> (img, mask)
+────────────────────────────────────────────────────────────────────────────────
+Thực thi augmentation lên 1 cặp ảnh/mask:
+  Bước 1: Kiểm tra và resize về 1024×1024 nếu cần.
+  Bước 2: Áp dụng spatial_tf lên cả ảnh và mask (synchronized).
+  Bước 3: Áp dụng photo_tf chỉ lên ảnh.
+  Trả về: (img_augmented, mask_augmented)
+
+────────────────────────────────────────────────────────────────────────────────
+6.4  generate_synthetic_background(size=1024) -> ndarray
+────────────────────────────────────────────────────────────────────────────────
+Sinh nền tổng hợp. Xem chi tiết tại Mục 5.3.
+Trả về ndarray BGR uint8 kích thước (size, size, 3).
+
+
+================================================================================
+7. PIPELINE CHÍNH — run_augmentation_pipeline()
+================================================================================
+
+Toàn bộ quy trình chia thành 5 bước tuần tự:
+
+BƯỚC 1 — Copy ảnh gốc (Step 1: Copy original images)
+─────────────────────────────────────────────────────
+  Mục đích : Giữ nguyên toàn bộ 700 ảnh gốc trong dataset augmented.
+  Suffix   : "_orig"
+  Số lượng : 700 cặp
+  Lý do    : Đảm bảo model luôn học trên một phần dữ liệu chân thực.
+
+BƯỚC 2 — Geometric + Photometric Augmentation (Step 2)
+───────────────────────────────────────────────────────
+  Số lần augment mỗi ảnh: aug_per_img = (TARGET_TOTAL - 700) // 700 = 9
+  Suffix   : "_geo_000" đến "_geo_008"
+  Số lượng : 700 × 9 = 6300 cặp
+  Chi tiết :
+    - 60% lần dùng spatial HARD, 40% dùng spatial LIGHT
+    - Photo chọn ngẫu nhiên từ pool [heavy,heavy,medium,medium,light]
+    - 20% có thêm multi-scale resize (scale < 1024, pad về 1024)
+
+BƯỚC 3 — Copy-Paste (Step 3)
+──────────────────────────────
+  Số lượng : int(7000 × 0.25) = 1750 cặp
+  Suffix   : "_cp_00000" đến "_cp_01749"
+  Chi tiết :
+    - Mỗi lần: chọn 1 ảnh foreground ngẫu nhiên từ 700 ảnh gốc
+    - Augment nhẹ foreground (spatial LIGHT)
+    - Sinh nền tổng hợp ngẫu nhiên
+    - Copy-paste với scale (0.3, 0.95) + edge blur
+    - Áp dụng photometric MEDIUM lên kết quả
+
+BƯỚC 4 — MixUp (Step 4)
+─────────────────────────
+  Số lượng : int(7000 × 0.10) = 700 cặp
+  Suffix   : "_mix_00000" đến "_mix_00699"
+  Chi tiết :
+    - Chọn 2 cặp ngẫu nhiên từ 700 ảnh gốc
+    - Trộn với lambda ~ Beta(0.4, 0.4) clamped [0.3, 0.7]
+
+BƯỚC 5 — CutMix (Step 5)
+──────────────────────────
+  Số lượng : int(7000 × 0.10) = 700 cặp
+  Suffix   : "_cut_00000" đến "_cut_00699"
+  Chi tiết :
+    - Chọn 2 cặp ngẫu nhiên từ 700 ảnh gốc
+    - Hoán đổi vùng chữ nhật với lambda ~ Beta(1.0, 1.0)
+
+TỔNG KẾT:
+  Lý thuyết : 700 + 6300 + 1750 + 700 + 700 = 10.150 cặp
+  Thực tế   : 10.150 cặp (verified sau khi chạy)
+  Kích thước: ~3.03 GB
+
+Thống kê in ra sau khi hoàn tất:
+  - Tổng ảnh  : số file .jpg trong AUG_IMG
+  - Tổng masks: số file .png trong AUG_MASK
+  - Output dir: đường dẫn thư mục train_augmented
+
+
+================================================================================
+8. DATASET CLASS — BiRefNetDataset (PyTorch)
+================================================================================
+
+Khai báo: class BiRefNetDataset(torch.utils.data.Dataset)
+Yêu cầu : PyTorch đã được cài đặt.
+
+Mục đích:
+  Cung cấp DataLoader-compatible dataset class để dùng trực tiếp trong
+  vòng lặp training PyTorch của BiRefNet.
+
+Constructor:
+  BiRefNetDataset(
+      img_dir  : str,           # Đường dẫn thư mục chứa ảnh
+      mask_dir : str,           # Đường dẫn thư mục chứa mask
+      img_size : int = 1024,    # Kích thước resize đầu vào
+      augment  : bool = True    # Bật/tắt online augmentation nhẹ
+  )
+
+Online Augmentation (khi augment=True):
+  - Spatial LIGHT: HFlip + Rotate90 + Rotate(±20°) + RandomResizedCrop
+  - Photometric LIGHT: Brightness ±0.15 + HSV ±10/15/10
+
+Chuẩn hóa (Normalize):
+  Dùng ImageNet statistics — BẮT BUỘC vì BiRefNet dùng Swin backbone
+  pretrained trên ImageNet:
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+  Áp dụng sau khi chia /255.0 → tensor nằm trong khoảng [-2.1, 2.6].
+
+Định dạng output của __getitem__:
+  img_tensor  : FloatTensor [3, 1024, 1024] — đã normalize
+  mask_tensor : FloatTensor [1, 1024, 1024] — binary {0.0, 1.0}
+
+Ví dụ sử dụng:
+  from augmentation_birefnet import BiRefNetDataset
+  from torch.utils.data import DataLoader
+
+  train_dataset = BiRefNetDataset(
+      img_dir  = "segmentation_dataset/train_augmented/images",
+      mask_dir = "segmentation_dataset/train_augmented/masks",
+      img_size = 1024,
+      augment  = True
+  )
+  train_loader = DataLoader(train_dataset, batch_size=4,
+                             shuffle=True, num_workers=4)
+
+  for imgs, masks in train_loader:
+      # imgs : [4, 3, 1024, 1024]
+      # masks: [4, 1, 1024, 1024]
+      ...
+
+
+================================================================================
+9. CÁCH SỬ DỤNG
+================================================================================
+
+9.1  Kiểm tra cấu hình (Dry Run):
+─────────────────────────────────
+  python augmentation_birefnet.py --dry-run
+
+  In ra thông tin:
+    - Số cặp ảnh/mask tìm thấy
+    - Số lần augment mỗi ảnh
+    - Số lượng mẫu cho từng phương pháp
+    - Xác nhận [OK] nếu cấu hình hợp lệ
+
+  Không tạo bất kỳ file nào.
+
+9.2  Chạy toàn bộ pipeline:
+────────────────────────────
+  python augmentation_birefnet.py
+
+  Output sẽ in ra:
+    [CONFIG] Gốc: 700 pairs → Mục tiêu: 7000 | Mỗi ảnh augment ~9×
+    [STEP 1] Copy ảnh gốc...            (thanh tiến trình)
+    [STEP 2] Geometric + Photometric... (thanh tiến trình)
+    [STEP 3] Copy-Paste Augmentation... (thanh tiến trình)
+    [STEP 4] MixUp Augmentation...      (thanh tiến trình)
+    [STEP 5] CutMix Augmentation...     (thanh tiến trình)
+    AUGMENTATION HOÀN TẤT!
+
+9.3  Thay đổi cấu hình:
+────────────────────────
+  Mở file augmentation_birefnet.py, sửa các dòng đầu:
+    IMAGE_SIZE       = 1024   ← Không nên đổi
+    TARGET_TOTAL     = 7000   ← Tăng để có nhiều mẫu hơn
+    COPY_PASTE_RATIO = 0.25   ← Tăng nếu muốn nhiều copy-paste hơn
+    MIXUP_RATIO      = 0.10   ← Giảm nếu không cần MixUp
+    CUTMIX_RATIO     = 0.10   ← Giảm nếu không cần CutMix
+
+9.4  Chạy lại từ đầu:
+──────────────────────
+  Xóa thư mục train_augmented/ trước khi chạy lại:
+    rmdir /s /q segmentation_dataset\train_augmented
+  Sau đó: python augmentation_birefnet.py
+
+
+================================================================================
+10. QUY ƯỚC ĐẶT TÊN FILE
+================================================================================
+
+Cấu trúc tên: {original_stem}_{augmentation_type}_{index}.{ext}
+
+  {original_stem}         : Tên gốc của ảnh (bỏ phần mở rộng)
+  {augmentation_type}     : Loại augmentation (xem bảng bên dưới)
+  {index}                 : Số thứ tự với zero-padding
+  {ext}                   : .jpg cho ảnh, .png cho mask
+
+Bảng mã augmentation:
+  _orig                   → Ảnh gốc nguyên bản (không augment)
+  _geo_000 đến _geo_008   → Geometric + Photometric augmentation
+  _cp_00000 đến _cp_01749 → Copy-Paste augmentation
+  _mix_00000 đến _mix_00699 → MixUp augmentation
+  _cut_00000 đến _cut_00699 → CutMix augmentation
+
+Ví dụ cụ thể:
+  abutilon_indicum_l_sweet_0025_1_orig.jpg
+  abutilon_indicum_l_sweet_0025_1_geo_004.jpg
+  abutilon_indicum_l_sweet_0025_1_cp_00832.jpg
+  catharanthus_roseus_0042_1_mix_00015.jpg
+  nelumbo_nucifera_gaertn_0011_1_cut_00203.jpg
+
+
+================================================================================
+11. KẾT QUẢ ĐẦU RA (ĐÃ CHẠY)
+================================================================================
+
+Thống kê sau khi pipeline thực thi thành công (2026-02-25):
+
+  Tổng ảnh (images)   : 10,150  file .jpg
+  Tổng masks          : 10,150  file .png
+  Image-Mask match    : 100%    (số lượng khớp hoàn toàn)
+  Dung lượng đĩa      : 3.03 GB
+  Thời gian chạy      : ~25 phút
+  Tỉ lệ mở rộng       : ×14.5  (700 → 10,150)
+
+Phân bố ước tính:
+  Original (no aug)   :    700 (  6.9%)
+  Geometric + Photo   :  6,300 ( 62.1%)
+  Copy-Paste          :  1,750 ( 17.2%)
+  MixUp               :    700 (  6.9%)
+  CutMix              :    700 (  6.9%)
+  ─────────────────────────────────────
+  TỔNG                : 10,150 (100.0%)
+
+Thư mục output:
+  c:/Users/TAN PHAT/OneDrive/Desktop/Segmentation/
+  └── segmentation_dataset/
+      └── train_augmented/
+          ├── images/   ← 10,150 *.jpg
+          └── masks/    ← 10,150 *.png
+
+
+================================================================================
+12. LƯU Ý KỸ THUẬT
+================================================================================
+
+12.1 Mask Integrity (Tính toàn vẹn của mask):
+  - Mask SAU augmentation LUÔN phải là binary (0 hoặc 255).
+  - Ngoại lệ duy nhất: mask từ MixUp có giá trị trung gian (soft label).
+  - NEVER dùng INTER_LINEAR/INTER_CUBIC để resize mask.
+  - CoarseDropout fill=0 nên đặt lên màu đen (background), không phải 255.
+
+12.2 Reproducibility (Tái tạo kết quả):
+  - RANDOM_SEED = 42 đảm bảo kết quả giống nhau mỗi lần chạy.
+  - Cần set cả random.seed(42) và np.random.seed(42).
+  - Albumentations có thể có internal state — đảm bảo seed trước mỗi run.
+
+12.3 Memory Management:
+  - Script đọc từng ảnh một (không load toàn bộ vào RAM).
+  - RAM peak ≈ 3 × IMAGE_SIZE² × 3 bytes ≈ ~9.5 MB/iteration.
+  - An toàn với RAM 4GB+.
+
+12.4 Data Leakage Prevention:
+  - Val và test KHÔNG được augment trong bất kỳ bước nào.
+  - Copy-paste backgrounds là SYNTHETIC — không lấy từ val/test.
+  - MixUp/CutMix CHỈ kết hợp mẫu trong train split.
+
+12.5 JPEG Quality:
+  - Lưu ảnh augmented với JPEG quality = 95.
+  - Không dùng 100 để tiết kiệm dung lượng mà vẫn giữ chất lượng tốt.
+  - Mask lưu dưới dạng PNG (lossless) để bảo toàn binary values.
+
+12.6 Border Mode khi Rotate:
+  - Dùng BORDER_REFLECT_101 (phản chiếu cạnh) thay vì BORDER_CONSTANT.
+  - Tránh xuất hiện dải đen tại góc ảnh sau khi xoay.
+  - Mask cũng được áp dụng cùng border mode để đồng bộ.
+
+12.7 Hạn chế của Script:
+  - Chạy đơn luồng (single-threaded) — không khai thác đa nhân.
+  - Cải thiện: Thêm multiprocessing.Pool để tăng tốc 4–8×.
+  - Gradient backgrounds sinh theo hàng (row-by-row) — chậm với size lớn.
+
+
+================================================================================
+13. TÀI LIỆU THAM KHẢO
+================================================================================
+
+[1] Buslaev, A., Iglovikov, V., Khvedchenya, E., Parinov, A., Druzhinin, M.,
+    & Kalinin, A. (2020). Albumentations: Fast and Flexible Image Augmentations.
+    Information, 11(2), 125. https://doi.org/10.3390/info11020125
+
+[2] Ghiasi, G., Cui, Y., Srinivas, A., Qian, R., Lin, T. Y., Cubuk, E. D., ...
+    & Zoph, B. (2021). Simple Copy-Paste is a Strong Data Augmentation Method
+    for Instance Segmentation. CVPR 2021. https://arxiv.org/abs/2012.07177
+
+[3] Zhang, H., Cisse, M., Dauphin, Y. N., & Lopez-Paz, D. (2018). Mixup:
+    Beyond Empirical Risk Minimization. ICLR 2018.
+    https://arxiv.org/abs/1710.09412
+
+[4] Yun, S., Han, D., Oh, S. J., Chun, S., Choe, J., & Yoo, Y. (2019).
+    CutMix: Training Strategy that Makes Use of Sample Mixing for Better
+    Performance. ICCV 2019. https://arxiv.org/abs/1905.04899
+
+[5] Zheng, X., Tian, X., Feng, J., & Zheng, W. S. (2024). Bilateral Reference
+    for High-Resolution Dichotomous Image Segmentation. CAAI Transactions on
+    Intelligence Technology. https://arxiv.org/abs/2401.03407
+
+[6] Lin, T. Y., Dollár, P., Girshick, R., He, K., Hariharan, B., & Belongie, S.
+    (2017). Feature Pyramid Networks for Object Detection. CVPR 2017.
+    https://arxiv.org/abs/1612.03144
+
+[7] DeVries, T., & Taylor, G. W. (2017). Improved Regularization of
+    Convolutional Neural Networks with Cutout. arXiv:1708.04552.
+
+================================================================================
+END OF DOCUMENTATION — augmentation_birefnet.py
+Generated: 2026-02-25 | Segmentation Project — BiRefNet Fine-Tuning
+================================================================================
